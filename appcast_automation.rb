@@ -32,9 +32,9 @@ class AppCast
   require 'openssl'
   require 'nokogiri'
   require 'base64'
+  require 'pathname'
 
   MESSAGE_HEADER    = 'RUN SCRIPT DURING BUILD MESSAGE'
-  YAML_FOLDER_PATH    = "#{ENV['HOME']}/Documents/Projects/_project_yaml/MVimLookup/"
 
   def initialize
     @signature = ''
@@ -61,7 +61,7 @@ class AppCast
   # Only works for Release builds
   # Exits upon failure
   def require_release_build
-    if ENV["BUILD_STYLE"] == 'Debug'
+    if ENV["BUILD_STYLE"] != 'Release'
       log_message("Distribution target requires 'Release' build style")
       exit
     end
@@ -69,9 +69,9 @@ class AppCast
 
   # Exits if no config.yaml file found.
   def load_config_file
-    config_file_path = "#{YAML_FOLDER_PATH}/config.yml"
+    config_file_path = @proj_dir + "appcast.yml"
     if !File.exists?(config_file_path)
-      log_message("No 'config.yaml' file found in project directory.")
+      log_message("No 'appcast.yaml' file found in project directory.")
       exit
     end
     @config = YAML.load_file(config_file_path)
@@ -79,37 +79,41 @@ class AppCast
 
   def exit_if_build_not_set_to_yes
     if @config['build_now'] != 'YES'
-      log_message("The 'build_now' setting in 'config.yaml' set to 'NO'\nIf you are wanting to include this script in\nthe build process change this setting to 'YES'")
+      log_message("The 'build_now' setting in 'appcast.yaml' set to 'NO'\nIf you are wanting to include this script in\nthe build process change this setting to 'YES'")
       exit
     end
   end
 
   def instantiate_project_variables
-    @proj_dir               = ENV['BUILT_PRODUCTS_DIR']
+  	@proj_dir				= Pathname.new(ENV['PROJECT_FILE_PATH']).parent
+    @build_dir               = ENV['BUILT_PRODUCTS_DIR']
     @proj_name              = ENV['PROJECT_NAME']
-    @version                = `defaults read "#{@proj_dir}/#{@proj_name}.app/Contents/Info" CFBundleShortVersionString`
-    @build_number			= `defaults read "#{@proj_dir}/#{@proj_name}.app/Contents/Info" CFBundleVersion`
-    @archive_filename       = "#{@proj_name}_#{@version.chomp}.zip" # underline character added
-    @archive_path           = "#{@proj_dir}/#{@archive_filename}"
+    @wrapper_name           = ENV['WRAPPER_NAME']
+    @version                = `defaults read "#{@build_dir}/#{@wrapper_name}/Contents/Info" CFBundleShortVersionString`
+    @build_number			      = `defaults read "#{@build_dir}/#{@wrapper_name}/Contents/Info" CFBundleVersion`
+    @archive_filename       = "#{@proj_name}-#{@build_number.chomp}.zip".sub(' ', '')
+    @archive_path           = "#{@build_dir}/#{@archive_filename}"
   end
 
   def instantiate_appcast_variables
     @appcast_xml_name       = @config['appcast_xml_name'].chomp
     @appcast_basefolder     = @config['appcast_basefolder'].chomp
-    @appcast_proj_folder    = "#{@config['appcast_basefolder']}/#{@proj_name}_#{@version}".chomp
+    @appcast_proj_folder    = "#{@appcast_basefolder}/" + "#{@proj_name}-#{@build_number}".chomp.sub(' ', '')
     @appcast_xml_path       = "#{@appcast_proj_folder}/#{@appcast_xml_name}"
     @download_base_url      = @config['download_base_url']
+    @release_notes_base_url = @config['release_notes_base_url']
     @keychain_privkey_name  = @config['keychain_privkey_name']
     @css_file_name          = @config['css_file_name']
-    @releasenotes_url       = "#{@download_base_url}#{@version.chomp}.html"
+    @releasenotes_url       = "#{@release_notes_base_url}#{@build_number.chomp}.html"
     @download_url           = "#{@download_base_url}#{@archive_filename}"
     @appcast_download_url	= "#{@download_base_url}#{@appcast_xml_name}"
   end
 
   def remove_old_zip_create_new_zip
-    Dir.chdir(@proj_dir)
-    `rm -f #{@proj_name}*.zip`
-    `ditto -c -k --keepParent -rsrc "#{@proj_name}.app" "#{@archive_filename}"`
+    Dir.chdir(@build_dir) do 
+      `rm -f #{@proj_name}*.zip`
+      `ditto -c -k --keepParent -rsrc "#{@wrapper_name}" "#{@archive_filename}"`
+    end
   end
 
   def copy_archive_to_appcast_path
@@ -121,8 +125,10 @@ class AppCast
   end
 
   def file_stats
-    @size     = File.size(@archive_filename)
-    @pubdate  = `date +"%a, %d %b %G %T %z"`
+    Dir.chdir(@build_dir) do 
+      @size     = File.size(@archive_filename)
+      @pubdate  = `date +"%a, %d %b %G %T %z"`
+    end
   end
   
   def get_key
@@ -161,7 +167,7 @@ class AppCast
 "<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <rss version=\"2.0\" xmlns:sparkle=\"http://www.andymatuschak.org/xml-namespaces/sparkle\"  xmlns:dc=\"http://purl.org/dc/elements/1.1/\">
   <channel>
-    <title>#{@proj_name}_#{@version.chomp}</title>
+    <title>#{@proj_name}</title>
     <link>#{@appcast_download_url}</link>
     <description>Most recent changes with links to updates.</description>
     <language>en</language>
