@@ -1,5 +1,5 @@
 #!/usr/bin/env ruby -w
-
+#
 #################################################################################
 #                                                                               #
 #     appcast_automation.rb                                                     #
@@ -25,25 +25,30 @@
 #################################################################################
 
 class AppCast
+  require 'rubygems'
   require 'yaml'
   require 'tmpdir'
   require 'fileutils'
-  
+  require 'openssl'
+  require 'nokogiri'
+  require 'base64'
+  require 'pathname'
+
   MESSAGE_HEADER    = 'RUN SCRIPT DURING BUILD MESSAGE'
-  
+
   def initialize
     @signature = ''
     require_release_build
     instantiate_project_variables
     load_config_file
-    
+
     # the build_now setting in the config.yaml file
     # determines whether you want to perform this script
     # set to 'NO' until you are ready to publish
     exit_if_build_not_set_to_yes
     instantiate_appcast_variables
   end
-  
+
   def main_worker_bee
     create_appcast_folder_and_files
     remove_old_zip_create_new_zip
@@ -52,61 +57,65 @@ class AppCast
     create_appcast_xml
     copy_archive_to_appcast_path
   end
-  
+
   # Only works for Release builds
   # Exits upon failure
   def require_release_build
-      if ENV["BUILD_STYLE"] == 'Debug'
-        log_message("Distribution target requires 'Release' build style")
-        exit
-      end
+    if ENV["BUILD_STYLE"] != 'Release'
+      log_message("Distribution target requires 'Release' build style")
+      exit
+    end
   end
-  
+
   # Exits if no config.yaml file found.
   def load_config_file
-    config_file_path = "#{@proj_dir}/config.yaml"
+    config_file_path = @proj_dir + "appcast.yml"
     if !File.exists?(config_file_path)
-      log_message("No 'config.yaml' file found in project directory.")
+      log_message("No 'appcast.yaml' file found in project directory.")
       exit
     end
     @config = YAML.load_file(config_file_path)
   end
-  
+
   def exit_if_build_not_set_to_yes
-      if @config['build_now'] != 'YES'
-        log_message("The 'build_now' setting in 'config.yaml' set to 'NO'\nIf you are wanting to include this script in\nthe build process change this setting to 'YES'")
-        exit
-      end
+    if @config['build_now'] != 'YES'
+      log_message("The 'build_now' setting in 'appcast.yaml' set to 'NO'\nIf you are wanting to include this script in\nthe build process change this setting to 'YES'")
+      exit
+    end
   end
 
   def instantiate_project_variables
-    @proj_dir               = ENV['BUILT_PRODUCTS_DIR']
+  	@proj_dir				= Pathname.new(ENV['PROJECT_FILE_PATH']).parent
+    @build_dir               = ENV['BUILT_PRODUCTS_DIR']
     @proj_name              = ENV['PROJECT_NAME']
-    @version                = `defaults read "#{@proj_dir}/#{@proj_name}.app/Contents/Info" CFBundleShortVersionString`
-    @build_number			= `defaults read "#{@proj_dir}/#{@proj_name}.app/Contents/Info" CFBundleVersion`
-    @archive_filename       = "#{@proj_name}_#{@version.chomp}.zip" # underline character added
-    @archive_path           = "#{@proj_dir}/#{@archive_filename}"
+    @wrapper_name           = ENV['WRAPPER_NAME']
+    @version                = `defaults read "#{@build_dir}/#{@wrapper_name}/Contents/Info" CFBundleShortVersionString`
+    @build_number			      = `defaults read "#{@build_dir}/#{@wrapper_name}/Contents/Info" CFBundleVersion`
+    @archive_filename       = "#{@proj_name}-#{@build_number.chomp}.zip".sub(' ', '')
+    @archive_path           = "#{@build_dir}/#{@archive_filename}"
   end
 
   def instantiate_appcast_variables
     @appcast_xml_name       = @config['appcast_xml_name'].chomp
     @appcast_basefolder     = @config['appcast_basefolder'].chomp
-    @appcast_proj_folder    = "#{@config['appcast_basefolder']}/#{@proj_name}_#{@version}".chomp
+    @appcast_proj_folder    = "#{@appcast_basefolder}/" + "#{@proj_name}-#{@build_number}".chomp.sub(' ', '')
     @appcast_xml_path       = "#{@appcast_proj_folder}/#{@appcast_xml_name}"
     @download_base_url      = @config['download_base_url']
+    @release_notes_base_url = @config['release_notes_base_url']
     @keychain_privkey_name  = @config['keychain_privkey_name']
     @css_file_name          = @config['css_file_name']
-    @releasenotes_url       = "#{@download_base_url}#{@version.chomp}.html"
+    @releasenotes_url       = "#{@release_notes_base_url}#{@build_number.chomp}.html"
     @download_url           = "#{@download_base_url}#{@archive_filename}"
     @appcast_download_url	= "#{@download_base_url}#{@appcast_xml_name}"
   end
 
   def remove_old_zip_create_new_zip
-    Dir.chdir(@proj_dir)
-    `rm -f #{@proj_name}*.zip`
-    `ditto -c -k --keepParent -rsrc "#{@proj_name}.app" "#{@archive_filename}"`
+    Dir.chdir(@build_dir) do 
+      `rm -f #{@proj_name}*.zip`
+      `ditto -c -k --keepParent -rsrc "#{@wrapper_name}" "#{@archive_filename}"`
+    end
   end
-  
+
   def copy_archive_to_appcast_path
     begin
       FileUtils.cp(@archive_path, @appcast_proj_folder)
@@ -114,66 +123,73 @@ class AppCast
       log_message("There was an error copying the zip file to appcast folder\nError: #{$!}")
     end
   end
-  
+
   def file_stats
-    @size     = File.size(@archive_filename)
-    @pubdate  = `date +"%a, %d %b %G %T %z"`
+    Dir.chdir(@build_dir) do 
+      @size     = File.size(@archive_filename)
+      @pubdate  = `date +"%a, %d %b %G %T %z"`
+    end
   end
   
+  def get_key
+    key_xml = `security find-generic-password -g -s "#{@keychain_privkey_name}" 2>&1 1>/dev/null`
+    xml = key_xml.gsub(/\\012/, "\n")
+    xml = "<?xml version=".concat(xml.split("<?xml version=")[1])
+    doc = Nokogiri::XML(xml)
+    doc.xpath("//key").xpath("//string").text
+  end
+
   def create_key
-    priv_key_path = "#{Dir.tmpdir}/priv_key.pem"
-    
-    key = `security find-generic-password -g -s "#{@keychain_privkey_name}" 2>&1 1>/dev/null | perl -pe '($_) = /"(.+)"/'`
-    
+    key = get_key
+
     if key.empty?
       log_message("Unable to load signing private key with name '#{@keychain_privkey_name}' from keychain\nFor file #{@archive_filename}")
       exit
     end
 
-    File.open(priv_key_path, 'w') { |f| f.puts key.split("\\012") }    
-    
-    @signature = `openssl dgst -sha1 -binary < '#{@archive_path}' \
-                   | openssl dgst -dss1 -sign '#{priv_key_path}' \
-                   | openssl enc -base64`
-
-    `rm -fP #{priv_key_path}`
-
-    log_message(@signature)
+    hashed = OpenSSL::Digest::SHA1.digest(File.read("#{@archive_path}"))
+    dsa = OpenSSL::PKey::DSA.new(key)
+    dss1 = OpenSSL::Digest::DSS1.new
+    sign = dsa.sign(dss1, hashed)
+    @signature = Base64.encode64(sign)
+    @signature = @signature.gsub("\n", '')
 
     if @signature.empty?
       log_message("Unable to sign file #{@archive_filename}")
       exit
+    else
+      log_message("New signature is \n#{@signature}")
     end
   end
-  
+
   def create_appcast_xml
-    appcast_xml = 
+    appcast_xml =
 "<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <rss version=\"2.0\" xmlns:sparkle=\"http://www.andymatuschak.org/xml-namespaces/sparkle\"  xmlns:dc=\"http://purl.org/dc/elements/1.1/\">
-   <channel>
-      <title>#{@proj_name}_#{@version.chomp}</title>
-      <link>#{@appcast_download_url}</link>
-	 <description>Most recent changes with links to updates.</description>
-      <language>en</language>
-         <item>
-            <title>Version #{@version.chomp}</title>
-			<sparkle:releaseNotesLink>
-					#{@releasenotes_url}
-				</sparkle:releaseNotesLink>
-            <pubDate>#{@pubdate.chomp}</pubDate>
-            <enclosure url=\"#{@download_url.chomp}\" 
-                    length=\"#{@size}\" 
-                    type=\"application/octet-stream\" 
-                    sparkle:version=\"#{@build_number.chomp}\"
-                    sparkle:shortVersionString=\"#{@version.chomp}\"
-                    sparkle:dsaSignature=\"#{@signature.chomp}\"/>
-         </item>
-   </channel>
+  <channel>
+    <title>#{@proj_name}</title>
+    <link>#{@appcast_download_url}</link>
+    <description>Most recent changes with links to updates.</description>
+    <language>en</language>
+    <item>
+	    <title>Version #{@version.chomp}</title>
+	    <sparkle:releaseNotesLink>
+		    #{@releasenotes_url}
+	    </sparkle:releaseNotesLink>
+	    <pubDate>#{@pubdate.chomp}</pubDate>
+	    <enclosure url=\"#{@download_url.chomp}\"
+	    length=\"#{@size}\"
+	    type=\"application/octet-stream\"
+	    sparkle:version=\"#{@build_number.chomp}\"
+	    sparkle:shortVersionString=\"#{@version.chomp}\"
+	    sparkle:dsaSignature=\"#{@signature.chomp}\"/>
+    </item>
+  </channel>
 </rss>"
 
     File.open(@appcast_xml_path, 'w') { |f| f.puts appcast_xml }
   end
-  
+
   # Creates the appcast folder if it does not exist
   # or is accidently moved or deleted
   # Creates an html file with generic note template if it does not exist
@@ -182,65 +198,66 @@ class AppCast
   def create_appcast_folder_and_files
     base_folder = @appcast_basefolder
     project_folder = @appcast_proj_folder
-    
+
     notes_file = "#{project_folder}/#{File.basename(@releasenotes_url.chomp)}"
     css_file_path = "#{project_folder}/#{@css_file_name}"
-    
+
     Dir.mkdir(base_folder)    if !File.exists?(base_folder)
     Dir.mkdir(project_folder) if !File.exists?(project_folder)
-    
-    File.open(notes_file, 'w') { |f| f.puts release_notes_generic_text } if !File.exists?(notes_file)
-    File.open(css_file_path, 'w') { |f| f.puts decompressed_css } if !File.exists?(css_file_path)
+
+    File.open(notes_file, 'w') { |f| f.puts release_notes_generic_text } unless File.exists?(notes_file)
+    File.open(css_file_path, 'w') { |f| f.puts decompressed_css } unless File.exists?(css_file_path)
   end
-  
+
   def log_message(msg)
     puts "\n\n----------------------------------------------"
     puts MESSAGE_HEADER
     puts msg
     puts "----------------------------------------------\n\n"
   end
-  
+
   def decompressed_css
     return css_text.gsub(/\{\s+/, "{\n\t").gsub(/;/, ";\n\t").gsub(/^\s+\}/, "}").gsub(/^\s+/, "\t")
   end
-  
+
   def release_notes_generic_text
-    return "<html>
+    return "
+<html>
+<head>
+  <meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">
+  <title>What's new in #{@proj_name}?</title>
+  <meta name=\"robots\" content=\"anchors\">
+  <link href=\"rnotes.css\" type=\"text/css\" rel=\"stylesheet\" media=\"all\">
+</head>
 
-    	<head>
-    		<meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">
-    		<title>What's new in #{@proj_name}?</title>
-    		<meta name=\"robots\" content=\"anchors\">
-    		<link href=\"rnotes.css\" type=\"text/css\" rel=\"stylesheet\" media=\"all\">
-    	</head>
+<body>
+  <br />
+  <table class=\"dots\" width=\"100%\" border=\"0\" cellspacing=\"0\" cellpadding=\"0\" summary=\"Two column table with heading\">
+    <tr>
+      <td class=\"blue\" colspan=\"2\">
+        <h3>#{@proj_name} #{@version.chomp} Release Notes</h3>
+      </td>
+    </tr>
+    <tr>
+      <td valign=\"top\">
+        <p>
+        <ul>
+          <li>DESCRIPTION</li>
+        </ul>
+        </p>
+      </td>
+    </tr>
+  </table>
+  <br>
+</body>
 
-    	<body>
-    		<br />
-    			<table class=\"dots\" width=\"100%\" border=\"0\" cellspacing=\"0\" cellpadding=\"0\" summary=\"Two column table with heading\">
-    				<tr>
-    					<td class=\"blue\" colspan=\"2\">
-    						<h3>#{@proj_name} #{@version.chomp} Release Notes</h3>
-    					</td>
-    				</tr>
-    				<tr>
-    					<td valign=\"top\">
-    						<p>
-    						<ul>
-    						<li>DESCRIPTION</li>
-    						</ul>
-    						</p>
-    					</td>
-    				</tr>
-    			</table>
-    			<br>
-    	</body>
-
-    </html>"    
+</html>"
   end
-  
+
   # This css will be expanded to a normal, easily editable form when written to file
   def css_text
-    return "body { margin: 2px 12px 12px; }
+    return "
+body { margin: 2px 12px 12px; }
 h1 h2 h3 p ol ul a a:hover { font-family: \"Lucida Grande\", Arial, sans-serif; }
 h1 { font-size: 11pt; margin-bottom: 0; }
 h2 { font-size: 9pt; margin-top: 0; margin-bottom: -10px; }
@@ -277,7 +294,7 @@ td { padding: 6px; }
 code { color: black; font-size: 9pt; font-family: Verdana, Courier, sans-serif; }"
   end
 end
-        
+
 if __FILE__ == $0
   newAppcast = AppCast.new
   newAppcast.main_worker_bee
